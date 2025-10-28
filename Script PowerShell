@@ -1,0 +1,828 @@
+param()
+$ErrorActionPreference = "Stop"
+
+$Root = "VENDO-TODO"
+$ZipName = "VENDO-TODO.zip"
+
+Write-Host "Creando estructura en .\$Root ..."
+if (Test-Path $Root) { Remove-Item -Recurse -Force $Root }
+New-Item -ItemType Directory -Path $Root | Out-Null
+$dirs = @(
+    "$Root\frontend\public",
+    "$Root\frontend\src\components",
+    "$Root\frontend\src\pages",
+    "$Root\frontend\src\hooks",
+    "$Root\backend",
+    "$Root\admin-panel\src",
+    "$Root\assets",
+    "$Root\documentation",
+    "$Root\.github\workflows"
+)
+foreach ($d in $dirs) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+
+# README.md
+@'
+# VENDO TODO
+
+Paquete completo "VENDO TODO" (Ventas El Bolsón)
+Stack: React + Vite (PWA), Firebase (Auth, Firestore, Storage), Backend: Node.js + Express, Mercado Pago (checkout).
+Incluye: frontend (PWA), admin-panel, backend con endpoint Mercado Pago y generación de tickets PDF (cliente y servidor), productos de ejemplo y GH Actions.
+
+Lee documentation/readme.md para pasos detallados.
+'@ | Out-File -FilePath "$Root\README.md" -Encoding UTF8
+
+# .env.example
+@'
+# BACKEND (copiar a backend/.env)
+PORT=4000
+MERCADOPAGO_ACCESS_TOKEN=TEST-xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+FRONTEND_URL=http://localhost:5173
+
+# Datos del negocio para tickets (reemplazar por tus datos)
+BUSINESS_NAME=VENTAS EL BOLSÓN
+BUSINESS_CUIT=00-00000000-0
+BUSINESS_ADDRESS=Calle Falsa 123, Localidad
+BUSINESS_PHONE=549XXXXXXXXX
+BUSINESS_EMAIL=ventas@tudominio.com
+BUSINESS_LOGO_PATH=/logo-512.png  # ruta pública en frontend/public
+
+# FRONTEND (copiar a frontend/.env)
+VITE_FIREBASE_API_KEY=your_firebase_api_key
+VITE_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
+VITE_FIREBASE_PROJECT_ID=your_project_id
+VITE_FIREBASE_STORAGE_BUCKET=your_project.appspot.com
+VITE_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
+VITE_FIREBASE_APP_ID=your_app_id
+
+VITE_MERCADOPAGO_PUBLIC_KEY=TEST-xxxxxxxxxxxxxxxxxxxxxxx
+VITE_BACKEND_URL=http://localhost:4000
+
+# ADMIN_PANEL (opcional lista de emails administradores)
+ADMIN_EMAILS=admin@tudominio.com,otroadmin@dominio.com
+'@ | Out-File -FilePath "$Root\.env.example" -Encoding UTF8
+
+# BACKEND package.json
+@'
+{
+  "name": "vendo-todo-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.2",
+    "mercadopago": "^2.6.5",
+    "body-parser": "^1.20.2",
+    "pdfkit": "^0.13.0",
+    "axios": "^1.4.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
+'@ | Out-File -FilePath "$Root\backend\package.json" -Encoding UTF8
+
+# BACKEND server.js
+@'
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const mercadopago = require("mercadopago");
+const PDFDocument = require("pdfkit");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:5173" }));
+app.use(bodyParser.json());
+
+if (process.env.MERCADOPAGO_ACCESS_TOKEN) {
+  mercadopago.configure({ access_token: process.env.MERCADOPAGO_ACCESS_TOKEN });
+} else {
+  console.warn("MERCADOPAGO_ACCESS_TOKEN no definido en .env");
+}
+
+app.post("/api/mercadopago/create_preference", async (req, res) => {
+  try {
+    const { items, payer } = req.body;
+    const preference = {
+      items: items.map(i => ({
+        title: i.title,
+        quantity: i.quantity,
+        unit_price: Number(i.price),
+        currency_id: "ARS"
+      })),
+      payer: payer || {},
+      back_urls: {
+        success: process.env.FRONTEND_URL + "/checkout/success",
+        failure: process.env.FRONTEND_URL + "/checkout/failure",
+        pending: process.env.FRONTEND_URL + "/checkout/pending"
+      },
+      auto_return: "approved"
+    };
+    const response = await mercadopago.preferences.create(preference);
+    return res.json({ preferenceId: response.body.id, init_point: response.body.init_point });
+  } catch (err) {
+    console.error("Error crear preferencia", err);
+    return res.status(500).json({ error: "No se pudo crear preferencia" });
+  }
+});
+
+app.post("/api/mercadopago/webhook", (req, res) => {
+  console.log("Webhook recibido:", req.body);
+  res.status(200).send("OK");
+});
+
+app.post("/api/ticket", (req, res) => {
+  const { sale } = req.body;
+  if (!sale) return res.status(400).json({ error: "sale es requerido" });
+
+  const bizName = process.env.BUSINESS_NAME || "VENDO TODO";
+  const bizCuit = process.env.BUSINESS_CUIT || "";
+  const bizAddress = process.env.BUSINESS_ADDRESS || "";
+  const bizPhone = process.env.BUSINESS_PHONE || "";
+  const bizEmail = process.env.BUSINESS_EMAIL || "";
+  const localLogo = path.join(__dirname, "..", "assets", "logo.png");
+
+  const doc = new PDFDocument({ size: "A4", margin: 40 });
+  let buffers = [];
+  doc.on("data", buffers.push.bind(buffers));
+  doc.on("end", () => {
+    const pdfData = Buffer.concat(buffers);
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename=ticket-${sale.id || Date.now()}.pdf`,
+      "Content-Length": pdfData.length
+    });
+    res.send(pdfData);
+  });
+
+  if (fs.existsSync(localLogo)) {
+    doc.image(localLogo, { fit: [120, 120], align: "left" });
+  }
+  doc.fontSize(18).text(bizName, { align: "right" });
+  doc.moveDown(0.2);
+  if (bizCuit) doc.fontSize(10).text("CUIT: " + bizCuit, { align: "right" });
+  if (bizAddress) doc.text(bizAddress, { align: "right" });
+  if (bizPhone) doc.text("Tel: " + bizPhone + (bizEmail ? " | " + bizEmail : ""), { align: "right" });
+  doc.moveDown();
+
+  doc.fontSize(12).text("Ticket de venta", { align: "center" });
+  doc.moveDown();
+  doc.fontSize(10).text("Fecha: " + (new Date(sale.date || Date.now())).toLocaleString());
+  if (sale.customer && sale.customer.name) doc.text("Cliente: " + sale.customer.name);
+  doc.moveDown();
+
+  doc.text("Items:");
+  doc.moveDown(0.5);
+  sale.items.forEach(i => {
+    doc.text(`- ${i.title} x${i.quantity}  $${i.price}`);
+  });
+  doc.moveDown();
+  doc.text("Total: $" + sale.total, { bold: true });
+  doc.moveDown(2);
+  doc.text("Gracias por su compra!", { align: "center" });
+  doc.end();
+});
+
+app.listen(PORT, () => {
+  console.log(`Backend escuchando en http://localhost:${PORT}`);
+});
+'@ | Out-File -FilePath "$Root\backend\server.js" -Encoding UTF8
+
+# FRONTEND package.json
+@'
+{
+  "name": "vendo-todo-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "firebase": "^9.22.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.14.1",
+    "axios": "^1.4.0",
+    "jspdf": "^2.5.1"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0"
+  }
+}
+'@ | Out-File -FilePath "$Root\frontend\package.json" -Encoding UTF8
+
+# FRONTEND index.html
+@'
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>VENDO TODO</title>
+    <link rel="manifest" href="/manifest.json" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+'@ | Out-File -FilePath "$Root\frontend\index.html" -Encoding UTF8
+
+# FRONTEND manifest.json
+@'
+{
+  "short_name": "VENDOTODO",
+  "name": "VENDO TODO - Tienda",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "description": "App de ventas - VENDO TODO",
+  "icons": [
+    { "src": "/logo-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/logo-512.png", "sizes": "512x512", "type": "image/png" }
+  ],
+  "theme_color": "#2B8A3E"
+}
+'@ | Out-File -FilePath "$Root\frontend\public\manifest.json" -Encoding UTF8
+
+# FRONTEND main.jsx
+@'
+import React from "react";
+import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
+import "./styles.css";
+
+createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+);
+'@ | Out-File -FilePath "$Root\frontend\src\main.jsx" -Encoding UTF8
+
+# FRONTEND firebase.js
+@'
+import { initializeApp } from "firebase/app";
+import { getAuth } from "firebase/auth";
+import { getFirestore } from "firebase/firestore";
+import { getStorage } from "firebase/storage";
+
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
+};
+
+const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+export const db = getFirestore(app);
+export const storage = getStorage(app);
+export default app;
+'@ | Out-File -FilePath "$Root\frontend\src\firebase.js" -Encoding UTF8
+
+# FRONTEND App.jsx
+@'
+import React from "react";
+import { Routes, Route, Link } from "react-router-dom";
+import ProductList from "./components/ProductList";
+import Cart from "./components/Cart";
+import Checkout from "./pages/Checkout";
+
+export default function App() {
+  return (
+    <div>
+      <header style={{ padding: 16, background: "#2B8A3E", color: "white" }}>
+        <h1>VENDO TODO</h1>
+        <nav>
+          <Link to="/" style={{ color: "white", marginRight: 10 }}>Tienda</Link>
+          <Link to="/cart" style={{ color: "white" }}>Carrito</Link>
+          <Link to="/admin" style={{ color: "white", marginLeft: 10 }}>Admin</Link>
+        </nav>
+      </header>
+
+      <main style={{ padding: 16 }}>
+        <Routes>
+          <Route path="/" element={<ProductList />} />
+          <Route path="/cart" element={<Cart />} />
+          <Route path="/checkout" element={<Checkout />} />
+          <Route path="/checkout/success" element={<div>Pago aprobado. Gracias!</div>} />
+          <Route path="/checkout/failure" element={<div>Pago fallido.</div>} />
+          <Route path="/checkout/pending" element={<div>Pago pendiente.</div>} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+'@ | Out-File -FilePath "$Root\frontend\src\App.jsx" -Encoding UTF8
+
+# FRONTEND ProductList.jsx
+@'
+import React, { useEffect, useState } from "react";
+import { collection, getDocs } from "firebase/firestore";
+import { db } from "../firebase";
+import useCart from "../hooks/useCart";
+
+export default function ProductList() {
+  const [products, setProducts] = useState([]);
+  const { addItem } = useCart();
+
+  useEffect(() => {
+    async function load() {
+      const snap = await getDocs(collection(db, "products"));
+      const list = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      setProducts(list);
+    }
+    load();
+  }, []);
+
+  return (
+    <div>
+      <h2>Productos</h2>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 12 }}>
+        {products.map(p => (
+          <div key={p.id} style={{ border: "1px solid #ddd", padding: 12 }}>
+            <img src={p.image || "/logo-192.png"} alt={p.title} style={{ width: "100%", height: 160, objectFit: "cover" }} />
+            <h3>{p.title}</h3>
+            <p>{p.description}</p>
+            <p><b>${p.price}</b></p>
+            <button onClick={() => addItem({ id: p.id, title: p.title, price: p.price, quantity: 1 })}>Agregar al carrito</button>
+            <a style={{ marginLeft: 8 }} href={`https://wa.me/${process.env.VITE_WHATSAPP_NUMBER || "549XXXXXXXXX"}?text=Hola%20quiero%20comprar%20${encodeURIComponent(p.title)}`} target="_blank" rel="noreferrer">WhatsApp</a>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+'@ | Out-File -FilePath "$Root\frontend\src\components\ProductList.jsx" -Encoding UTF8
+
+# FRONTEND hooks/useCart.js
+@'
+import { useState, useEffect } from "react";
+import { collection, addDoc } from "firebase/firestore";
+import { db } from "../firebase";
+
+const CART_KEY = "vt_cart";
+
+export default function useCart() {
+  const [items, setItems] = useState([]);
+
+  useEffect(() => {
+    const raw = localStorage.getItem(CART_KEY);
+    if (raw) setItems(JSON.parse(raw));
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(CART_KEY, JSON.stringify(items));
+  }, [items]);
+
+  const addItem = item => {
+    setItems(prev => {
+      const idx = prev.findIndex(p => p.id === item.id);
+      if (idx >= 0) {
+        const cp = [...prev];
+        cp[idx].quantity += item.quantity || 1;
+        return cp;
+      }
+      return [...prev, item];
+    });
+  };
+
+  const removeItem = id => setItems(prev => prev.filter(p => p.id !== id));
+  const clear = () => setItems([]);
+  const total = items.reduce((s, i) => s + (i.quantity * Number(i.price)), 0);
+
+  const saveSale = async (sale) => {
+    try {
+      await addDoc(collection(db, "sales"), sale);
+    } catch (err) {
+      console.error("Error guardando venta en Firestore", err);
+    }
+  };
+
+  return { items, addItem, removeItem, clear, total, saveSale };
+}
+'@ | Out-File -FilePath "$Root\frontend\src\hooks\useCart.js" -Encoding UTF8
+
+# FRONTEND Cart.jsx
+@'
+import React from "react";
+import { useNavigate } from "react-router-dom";
+import useCart from "../hooks/useCart";
+
+export default function Cart() {
+  const { items, removeItem, clear, total } = useCart();
+  const navigate = useNavigate();
+
+  return (
+    <div>
+      <h2>Carrito</h2>
+      {items.length === 0 && <p>El carrito está vacío.</p>}
+      {items.map(i => (
+        <div key={i.id} style={{ borderBottom: "1px solid #eee", padding: 8 }}>
+          <b>{i.title}</b> x {i.quantity} — ${i.price}
+          <button style={{ marginLeft: 8 }} onClick={() => removeItem(i.id)}>Eliminar</button>
+        </div>
+      ))}
+      <h3>Total: ${total}</h3>
+      <button onClick={() => navigate("/checkout")}>Finalizar compra</button>
+      <button onClick={clear} style={{ marginLeft: 8 }}>Vaciar</button>
+    </div>
+  );
+}
+'@ | Out-File -FilePath "$Root\frontend\src\components\Cart.jsx" -Encoding UTF8
+
+# FRONTEND Checkout.jsx
+@'
+import React from "react";
+import useCart from "../hooks/useCart";
+import axios from "axios";
+import { jsPDF } from "jspdf";
+
+export default function Checkout() {
+  const { items, clear, total, saveSale } = useCart();
+
+  const handlePay = async () => {
+    if (items.length === 0) return alert("El carrito está vacío");
+
+    try {
+      const backendUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:4000";
+      const payload = {
+        items: items.map(i => ({ title: i.title, quantity: i.quantity, price: i.price })),
+        payer: { email: "" }
+      };
+
+      const res = await axios.post(`${backendUrl}/api/mercadopago/create_preference`, payload);
+      if (res.data.init_point) {
+        const sale = {
+          items: payload.items,
+          total,
+          date: new Date().toISOString(),
+          status: "pending"
+        };
+        await saveSale(sale);
+        window.location.href = res.data.init_point;
+      } else {
+        alert("No se pudo generar la preferencia de pago.");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Error al iniciar pago.");
+    }
+  };
+
+  const generatePDF = async () => {
+    const doc = new jsPDF();
+    const bizName = import.meta.env.VITE_BUSINESS_NAME || "VENDO TODO";
+    const bizCuit = import.meta.env.VITE_BUSINESS_CUIT || "";
+    const bizAddress = import.meta.env.VITE_BUSINESS_ADDRESS || "";
+    const bizPhone = import.meta.env.VITE_BUSINESS_PHONE || "";
+    const logoPath = import.meta.env.VITE_BUSINESS_LOGO || "/logo-512.png";
+
+    try {
+      const imgData = await fetch(logoPath).then(r => r.blob()).then(blob => {
+        return new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.readAsDataURL(blob);
+        });
+      });
+      doc.addImage(imgData, "PNG", 14, 10, 40, 40);
+    } catch (err) {
+      console.warn("No se pudo cargar logo para PDF cliente", err);
+    }
+
+    doc.setFontSize(16);
+    doc.text(bizName, 140, 20, null, null, "right");
+    if (bizCuit) doc.setFontSize(10).text("CUIT: " + bizCuit, 140, 28, null, null, "right");
+    if (bizAddress) doc.text(bizAddress, 140, 36, null, null, "right");
+    if (bizPhone) doc.text("Tel: " + bizPhone, 140, 44, null, null, "right");
+
+    doc.setFontSize(12);
+    doc.text("Ticket de venta", 14, 60);
+    doc.text("Fecha: " + new Date().toLocaleString(), 14, 68);
+    let y = 80;
+    items.forEach(i => {
+      doc.text(`- ${i.title} x${i.quantity}  $${i.price}`, 14, y);
+      y += 8;
+    });
+    doc.text(`Total: $${total}`, 14, y + 8);
+    doc.save(`ticket-${Date.now()}.pdf`);
+  };
+
+  return (
+    <div>
+      <h2>Checkout</h2>
+      <p>Total a pagar: ${total}</p>
+      <button onClick={handlePay}>Pagar con Mercado Pago</button>
+      <button onClick={generatePDF} style={{ marginLeft: 8 }}>Generar recibo (PDF)</button>
+      <p>O contacta vía WhatsApp si prefieres pago en efectivo.</p>
+    </div>
+  );
+}
+'@ | Out-File -FilePath "$Root\frontend\src\pages\Checkout.jsx" -Encoding UTF8
+
+# FRONTEND styles.css
+@'
+body { font-family: Arial, sans-serif; margin: 0; background: #fafafa; color: #222; }
+a { color: #2B8A3E; }
+button { background: #2B8A3E; color: #fff; border: none; padding: 8px 12px; cursor: pointer; }
+button:hover { opacity: 0.9; }
+'@ | Out-File -FilePath "$Root\frontend\src\styles.css" -Encoding UTF8
+
+# FRONTEND .env.example (business placeholders)
+@'
+VITE_BUSINESS_NAME=VENTAS EL BOLSÓN
+VITE_BUSINESS_CUIT=00-00000000-0
+VITE_BUSINESS_ADDRESS=Calle Falsa 123
+VITE_BUSINESS_PHONE=549XXXXXXXXX
+VITE_BUSINESS_LOGO=/logo-512.png
+'@ | Out-File -FilePath "$Root\frontend\.env.example" -Encoding UTF8
+
+# ADMIN PANEL package.json
+@'
+{
+  "name": "vendo-todo-admin",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "firebase": "^9.22.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.14.1"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0"
+  }
+}
+'@ | Out-File -FilePath "$Root\admin-panel\package.json" -Encoding UTF8
+
+# ADMIN PANEL files
+@'
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Admin VENDO TODO</title></head>
+<body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body>
+</html>
+'@ | Out-File -FilePath "$Root\admin-panel\index.html" -Encoding UTF8
+
+@'
+import { initializeApp } from "firebase/app";
+const firebaseConfig = {
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID
+};
+const app = initializeApp(firebaseConfig);
+export default app;
+'@ | Out-File -FilePath "$Root\admin-panel\src\firebaseConfig.jsx" -Encoding UTF8
+
+@'
+import React from "react";
+import { createRoot } from "react-dom/client";
+import AdminApp from "./AdminApp";
+import "./styles.css";
+
+createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <AdminApp />
+  </React.StrictMode>
+);
+'@ | Out-File -FilePath "$Root\admin-panel\src\main.jsx" -Encoding UTF8
+
+@'
+import React from "react";
+import UploadForm from "./UploadForm";
+
+export default function AdminApp() {
+  return (
+    <div style={{ padding: 20 }}>
+      <h1>Admin - VENDO TODO</h1>
+      <UploadForm />
+      <p>Protege este panel en producción (reglas Firestore o verificación de emails).</p>
+    </div>
+  );
+}
+'@ | Out-File -FilePath "$Root\admin-panel\src\AdminApp.jsx" -Encoding UTF8
+
+@'
+import React, { useState } from "react";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
+import { getFirestore, collection, addDoc } from "firebase/firestore";
+import app from "./firebaseConfig";
+
+export default function UploadForm() {
+  const [title, setTitle] = useState("");
+  const [price, setPrice] = useState("");
+  const [desc, setDesc] = useState("");
+  const [file, setFile] = useState(null);
+
+  const onSubmit = async (e) => {
+    e.preventDefault();
+    const storage = getStorage(app);
+    const db = getFirestore(app);
+    let imageUrl = "";
+    if (file) {
+      const storageRef = ref(storage, `products/${Date.now()}-${file.name}`);
+      await uploadBytes(storageRef, file);
+      imageUrl = await getDownloadURL(storageRef);
+    }
+    await addDoc(collection(db, "products"), {
+      title, price: Number(price), description: desc, image: imageUrl, stock: 100, category: "General"
+    });
+    alert("Producto subido");
+    setTitle(""); setPrice(""); setDesc(""); setFile(null);
+  };
+
+  return (
+    <form onSubmit={onSubmit}>
+      <div><input placeholder="Título" value={title} onChange={e=>setTitle(e.target.value)} required/></div>
+      <div><input placeholder="Precio" value={price} onChange={e=>setPrice(e.target.value)} required/></div>
+      <div><textarea placeholder="Descripción" value={desc} onChange={e=>setDesc(e.target.value)} /></div>
+      <div><input type="file" onChange={e=>setFile(e.target.files[0])} /></div>
+      <button type="submit">Subir producto</button>
+    </form>
+  );
+}
+'@ | Out-File -FilePath "$Root\admin-panel\src\UploadForm.jsx" -Encoding UTF8
+
+@'
+body { font-family: Arial, sans-serif; padding: 10px; }
+input, textarea { display: block; margin: 8px 0; padding: 8px; width: 100%; max-width: 400px; }
+button { background: #2B8A3E; color: #fff; border: none; padding: 8px 12px; cursor: pointer; }
+'@ | Out-File -FilePath "$Root\admin-panel\src\styles.css" -Encoding UTF8
+
+# PRODUCTS SAMPLE JSON
+@'
+[
+  {"title":"Alfajor artesanal","description":"Alfajor dulce casero","price":150,"image":"","stock":20,"category":"Alimentos"},
+  {"title":"Mermelada frutal","description":"Mermelada artesanal 250g","price":320,"image":"","stock":15,"category":"Alimentos"},
+  {"title":"Dulce de leche","description":"Dulce de leche tradicional 400g","price":480,"image":"","stock":10,"category":"Alimentos"},
+  {"title":"Jabón natural","description":"Jabón artesanal de lavanda","price":250,"image":"","stock":30,"category":"Hogar"},
+  {"title":"Bandeja de madera","description":"Bandeja rústica hecha a mano","price":950,"image":"","stock":5,"category":"Decoración"},
+  {"title":"Mueble chico","description":"Mesa auxiliar pequeña","price":5500,"image":"","stock":2,"category":"Muebles"}
+]
+'@ | Out-File -FilePath "$Root\products_sample.json" -Encoding UTF8
+
+# DOCUMENTATION readme.md
+@'
+Documentación rápida para VENDO-TODO
+
+1) Generar proyecto Firebase:
+ - En console.firebase.google.com crea un proyecto.
+ - Habilita Authentication (Email, Google; Facebook requiere APP id/secret).
+ - Crea Firestore (modo pruebas durante desarrollo).
+ - Crea Storage para imágenes.
+ - Copia las credenciales y pégalas en frontend/.env y admin-panel variables (usar .env.example).
+
+2) Mercado Pago:
+ - Crea cuenta en Mercado Pago y en Developers obtén credenciales de TEST (sandbox).
+ - Pegar MERCADOPAGO_ACCESS_TOKEN en backend/.env.
+ - Pegar VITE_MERCADOPAGO_PUBLIC_KEY en frontend/.env (no es obligatorio para este flujo).
+
+3) Instalar dependencias y ejecutar:
+ - Backend:
+   cd backend
+   cp ../.env.example .env
+   # editar backend/.env con MERCADOPAGO_ACCESS_TOKEN y datos del negocio
+   npm install
+   npm run dev
+ - Frontend:
+   cd frontend
+   cp ../.env.example .env
+   # editar frontend/.env con VITE_... y datos del negocio
+   npm install
+   npm run dev
+ - Admin-panel:
+   cd admin-panel
+   cp ../.env.example .env
+   npm install
+   npm run dev
+
+4) Subir productos:
+ - Importar products_sample.json desde Firebase Console (Firestore): crear collection 'products' y añadir documentos.
+ - O usar admin-panel para subir productos y subir imágenes a Storage.
+
+5) Pruebas de pago:
+ - Con backend corriendo y MERCADOPAGO_ACCESS_TOKEN de sandbox, desde frontend crear preferencia y serás redirigido a MP sandbox.
+
+6) Tickets:
+ - Cliente: botón "Generar recibo (PDF)" en Checkout genera PDF con logo público y datos del negocio.
+ - Backend: POST /api/ticket genera PDF desde servidor; envía el objeto sale en el body.
+
+Seguridad:
+ - No subir archivos .env con claves.
+ - Proteger admin-panel (reglas Firestore y verificación de emails ADMIN_EMAILS).
+'@ | Out-File -FilePath "$Root\documentation\readme.md" -Encoding UTF8
+
+# GitHub Actions workflow
+@'
+name: CI - build
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install front deps
+        run: |
+          cd frontend
+          npm install
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm run build
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+  build-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install backend deps
+        run: |
+          cd backend
+          npm install
+      - name: Upload backend files
+        uses: actions/upload-artifact@v3
+        with:
+          name: backend-src
+          path: backend
+'@ | Out-File -FilePath "$Root\.github\workflows\ci.yml" -Encoding UTF8
+
+# .gitignore
+@'
+node_modules
+.env
+.env.local
+dist
+.DS_Store
+VENDO-TODO.zip
+'@ | Out-File -FilePath "$Root\.gitignore" -Encoding UTF8
+
+# Assets placeholders (empty files as placeholders for logos)
+New-Item -Path "$Root\frontend\public\logo-192.png" -ItemType File -Force | Out-Null
+New-Item -Path "$Root\frontend\public\logo-512.png" -ItemType File -Force | Out-Null
+New-Item -Path "$Root\assets\logo.png" -ItemType File -Force | Out-Null
+
+# Optional small README in assets
+@'
+Reemplaza los siguientes archivos por tu logo:
+- frontend/public/logo-192.png
+- frontend/public/logo-512.png
+- backend/assets/logo.png  (opcional, usado por backend si existe)
+
+Datos del negocio para tickets: editar backend/.env y frontend/.env según .env.example
+'@ | Out-File -FilePath "$Root\assets\README.txt" -Encoding UTF8
+
+Write-Host "Comprimiendo en $ZipName ..."
+if (Test-Path $ZipName) { Remove-Item $ZipName -Force }
+Compress-Archive -Path "$Root\*" -DestinationPath $ZipName -Force
+
+Write-Host "Hecho. Archivo generado: $ZipName"
+Write-Host ""
+Write-Host "Siguientes pasos recomendados:"
+Write-Host "1) Abrí la carpeta $Root y reemplazá los logos en frontend/public/logo-192.png y logo-512.png y opcional backend/assets/logo.png."
+Write-Host "2) Copiá .env.example a backend/.env y frontend/.env y completá las claves (Firebase, Mercado Pago) y datos del negocio."
+Write-Host "3) Instalá dependencias y ejecutá en cada carpeta:"
+Write-Host "   cd $Root\backend ; npm install ; npm run dev"
+Write-Host "   cd $Root\frontend ; npm install ; npm run dev"
+Write-Host "   cd $Root\admin-panel ; npm install ; npm run dev"
+Write-Host ""
+Write-Host "Si querés, te doy ahora los comandos exactos para crear el repo VENDO-TODO en GitHub y subir los archivos (paso a paso)."
